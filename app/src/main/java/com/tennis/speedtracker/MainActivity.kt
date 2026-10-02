@@ -2,6 +2,7 @@ package com.tennis.speedtracker
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioFormat
@@ -11,6 +12,7 @@ import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.view.MotionEvent
 import android.view.View
 import android.widget.Button
@@ -26,6 +28,7 @@ import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.log10
 import kotlin.math.sqrt
@@ -47,30 +50,29 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSetImpact: Button
     private lateinit var btnSetBounce: Button
 
-    // 1. 코트 캘리브레이션 (호모그래피)
     private val calibPixels = mutableListOf<Pair<Double, Double>>()
     private var homographyMatrix: DoubleArray? = null
     private val realCourtPoints = listOf(
         Pair(-4.115, 0.0), Pair(4.115, 0.0), Pair(-4.115, 18.29), Pair(4.115, 18.29)
     )
 
-    // 2. 모드 상태 제어
     private var isVideoMode = false
     private var isSelectingBounce = false
-
-    // 3. 비디오 분석 모드 변수
     private var mediaPlayer: MediaPlayer? = null
     private var currentMs = 0L
     private var videoImpactMs = -1L
 
-    // 4. 실시간(라이브) 모드 변수
     private var isAudioListening = false
     private var liveImpactTimeMs = -1L
     private var liveAudioScope = CoroutineScope(Dispatchers.IO)
 
-    // 비디오 파일 선택 런처
-    private val pickVideoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        uri?.let { loadVideoFile(it) }
+    // 구글 포토를 우회하고 '삼성 내장 갤러리'를 강제 호출하는 런처
+    private val pickVideoLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            result.data?.data?.let { uri -> loadVideoFileRobustly(uri) }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -106,7 +108,6 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("ClickableViewAccessibility")
     private fun setupListeners() {
-        // [화면 터치 통합 처리기]
         touchOverlay.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_DOWN) {
                 handleScreenTouch(event.x.toDouble(), event.y.toDouble())
@@ -123,7 +124,6 @@ class MainActivity : AppCompatActivity() {
             tvSubStats.text = "코트 기준점 4개를 먼저 등록해주세요"
         }
 
-        // [모드 1] 실시간 카메라 모드 전환
         btnModeLive.setOnClickListener {
             isVideoMode = false
             videoView.visibility = View.GONE
@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
             mediaPlayer?.pause()
             
             toggleVideoControls(false)
-            startAudioTrigger() // 실시간 타구음 감지 시작
+            startAudioTrigger()
             
             if (homographyMatrix != null) {
                 tvGuide.text = "[라이브 모드] 서브(소리) 후 바운드 지점을 화면에서 터치하세요!"
@@ -140,34 +140,26 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // [모드 2] 동영상 분석 모드 전환
         btnLoadVideo.setOnClickListener {
-            stopAudioTrigger() // 비디오 모드에선 마이크 끄기
-            pickVideoLauncher.launch("video/*")
+            stopAudioTrigger()
+            // 강제로 시스템 갤러리(MediaStore) 앱을 띄우는 Intent
+            val intent = Intent(Intent.ACTION_PICK, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            intent.type = "video/*"
+            pickVideoLauncher.launch(intent)
         }
 
-        // 비디오: 1프레임(약 16ms) 뒤로 가기 (API 26 이상 SEEK_CLOSEST 사용)
         btnPrevFrame.setOnClickListener {
             mediaPlayer?.let { mp ->
                 currentMs = (currentMs - 16).coerceAtLeast(0)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    mp.seekTo(currentMs, MediaPlayer.SEEK_CLOSEST)
-                } else {
-                    mp.seekTo(currentMs.toInt())
-                }
+                seekToAccurate(mp, currentMs)
                 updateVideoGuide()
             }
         }
 
-        // 비디오: 1프레임 앞으로 가기
         btnNextFrame.setOnClickListener {
             mediaPlayer?.let { mp ->
                 currentMs = (currentMs + 16).coerceAtMost(mp.duration.toLong())
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    mp.seekTo(currentMs, MediaPlayer.SEEK_CLOSEST)
-                } else {
-                    mp.seekTo(currentMs.toInt())
-                }
+                seekToAccurate(mp, currentMs)
                 updateVideoGuide()
             }
         }
@@ -188,8 +180,62 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun seekToAccurate(mp: MediaPlayer, targetMs: Long) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            mp.seekTo(targetMs, MediaPlayer.SEEK_CLOSEST)
+        } else {
+            mp.seekTo(targetMs.toInt())
+        }
+    }
+
+    // 재생 불가 버그를 방지하는 강력한 로컬 캐시 복제 로직
+    private fun loadVideoFileRobustly(uri: Uri) {
+        Toast.makeText(this, "영상을 안전하게 불러오는 중입니다...", Toast.LENGTH_SHORT).show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // 1. 앱 내부 캐시 폴더에 임시 파일 생성 (권한 충돌 방지)
+                val tempFile = File(cacheDir, "serve_video_temp.mp4")
+                
+                // 2. 갤러리의 영상 스트림을 안전한 로컬 파일로 1:1 고속 복사
+                contentResolver.openInputStream(uri)?.use { input ->
+                    tempFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                withContext(Dispatchers.Main) {
+                    isVideoMode = true
+                    viewFinder.visibility = View.GONE
+                    videoView.visibility = View.VISIBLE
+                    toggleVideoControls(true)
+
+                    // 3. 가상 URI(content://) 대신 실제 물리적 경로(Path)를 VideoView에 주입
+                    videoView.setVideoPath(tempFile.absolutePath)
+                    
+                    videoView.setOnPreparedListener { mp ->
+                        mediaPlayer = mp
+                        mp.pause()
+                        currentMs = 0L
+                        videoImpactMs = -1L
+                        seekToAccurate(mp, 0L)
+                        updateVideoGuide()
+                    }
+                    
+                    videoView.setOnErrorListener { _, what, extra ->
+                        Toast.makeText(this@MainActivity, "재생 오류가 발생했습니다. ($what, $extra)", Toast.LENGTH_LONG).show()
+                        true
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "영상 로드 실패: ${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
     private fun handleScreenTouch(x: Double, y: Double) {
-        // 1. 코트 4점 캘리브레이션 로직 (모드 공통)
         if (calibPixels.size < 4) {
             calibPixels.add(Pair(x, y))
             when (calibPixels.size) {
@@ -213,9 +259,7 @@ class MainActivity : AppCompatActivity() {
         val H = homographyMatrix
         if (H == null) return
 
-        // 2. 바운드 지점 터치에 따른 구속 연산
         if (isVideoMode && isSelectingBounce) {
-            // [비디오 모드 계산]
             val dtSec = (currentMs - videoImpactMs) / 1000.0
             if (dtSec <= 0) {
                 Toast.makeText(this, "바운드는 임팩트 이후여야 합니다.", Toast.LENGTH_SHORT).show()
@@ -226,17 +270,15 @@ class MainActivity : AppCompatActivity() {
             updateVideoGuide()
 
         } else if (!isVideoMode) {
-            // [실시간 라이브 모드 계산]
             if (liveImpactTimeMs > 0) {
                 val liveBounceTimeMs = System.currentTimeMillis()
                 val dtSec = (liveBounceTimeMs - liveImpactTimeMs) / 1000.0
                 
-                // 타구 2초 이상 지났으면 노이즈로 간주하고 무시
                 if (dtSec in 0.2..2.0) {
                     calculateAndShowSpeed(H, x, y, dtSec)
                     tvGuide.text = "측정 완료! (다음 서브 타구음 대기 중...)"
                 }
-                liveImpactTimeMs = -1L // 초기화
+                liveImpactTimeMs = -1L
             } else {
                 Toast.makeText(this, "타구 소리가 먼저 감지되어야 합니다.", Toast.LENGTH_SHORT).show()
             }
@@ -244,49 +286,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun calculateAndShowSpeed(H: DoubleArray, pixelX: Double, pixelY: Double, dtSec: Double) {
-        // 호모그래피 역변환 (화면 픽셀 -> 실제 코트 바닥 X, Y 미터 좌표)
         val (realX, realY) = HomographySolver.transform(H, pixelX, pixelY)
 
-        // 임팩트 위치: 베이스라인 중앙 약간 안쪽(0.0, 0.5), 타점 높이(2.7m)
         val impX = 0.0
         val impY = 0.5
         val impZ = 2.70
 
-        // 3D 유클리드 거리 공식
         val distance = sqrt(
             (realX - impX) * (realX - impX) +
             (realY - impY) * (realY - impY) +
             (0.0 - impZ) * (0.0 - impZ)
         )
 
-        // 구간 평균 속도 및 초속(항력계수 1.16) 연산
         val vAvgMps = distance / dtSec
         val vAvgKph = vAvgMps * 3.6
         val vInitKph = vAvgKph * 1.16
 
-        // UI 갱신
         tvSpeed.text = "%.1f KM/H".format(vInitKph)
         tvSpeed.setTextColor(Color.parseColor("#FF2222"))
         tvSubStats.text = "거리: %.2fm | 시간: %.3f초 | 착지점: (%.1f, %.1f)".format(distance, dtSec, realX, realY)
-    }
-
-    private fun loadVideoFile(uri: Uri) {
-        isVideoMode = true
-        viewFinder.visibility = View.GONE
-        videoView.visibility = View.VISIBLE
-        toggleVideoControls(true)
-
-        videoView.setVideoURI(uri)
-        videoView.setOnPreparedListener { mp ->
-            mediaPlayer = mp
-            mp.pause() // 자동 재생 방지
-            currentMs = 0L
-            videoImpactMs = -1L
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                mp.seekTo(0, MediaPlayer.SEEK_CLOSEST)
-            }
-            updateVideoGuide()
-        }
     }
 
     private fun toggleVideoControls(show: Boolean) {
@@ -302,7 +320,6 @@ class MainActivity : AppCompatActivity() {
         tvGuide.text = "비디오 분석 중 - 현재: ${currentMs}ms | 임팩트: $impStr"
     }
 
-    // --- [마이크 타구음 감지 엔진 (실시간 모드용)] ---
     @SuppressLint("MissingPermission")
     private fun startAudioTrigger() {
         if (!allPermissionsGranted() || isAudioListening) return
@@ -323,7 +340,6 @@ class MainActivity : AppCompatActivity() {
                     val rms = sqrt(sum / read)
                     val db = 20 * log10(rms)
 
-                    // 타구음 감지 (약 80dB 이상)
                     if (db > 80.0 && liveImpactTimeMs == -1L && homographyMatrix != null && !isVideoMode) {
                         liveImpactTimeMs = System.currentTimeMillis()
                         withContext(Dispatchers.Main) {
@@ -331,7 +347,7 @@ class MainActivity : AppCompatActivity() {
                             tvSpeed.text = "TRACKING"
                             tvSpeed.setTextColor(Color.parseColor("#FFCC00"))
                         }
-                        delay(2000) // 2초간 중복 감지 방지 (서브 비행시간 대기)
+                        delay(2000)
                     }
                 }
             }
@@ -373,7 +389,6 @@ class MainActivity : AppCompatActivity() {
     }
 }
 
-// 3x3 평면 호모그래피 행렬 자체 연산기 (오차 방지)
 object HomographySolver {
     fun findHomography(src: List<Pair<Double, Double>>, dst: List<Pair<Double, Double>>): DoubleArray? {
         if (src.size != 4 || dst.size != 4) return null
