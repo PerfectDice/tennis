@@ -18,14 +18,16 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      # Gradle 8.7 직접 설치 (gradlew 래퍼 파일 없이 빌드 가능)
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.7
+
+      # 안드로이드 SDK 경로 자동 지정 및 라이선스 승인
+      - name: Configure Android SDK Path
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       # APK 빌드 실행
       - name: Build Debug APK
