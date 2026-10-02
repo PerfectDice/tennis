@@ -1,10 +1,12 @@
 package com.tennis.speedtracker
 
 import android.Manifest
-import android.content.Intent
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Color
-import android.media.MediaMetadataRetriever
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Bundle
 import android.view.View
@@ -14,12 +16,15 @@ import android.widget.Toast
 import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.*
+import java.nio.ByteBuffer
+import java.util.concurrent.Executors
+import kotlin.math.log10
 
 class MainActivity : AppCompatActivity() {
 
@@ -27,20 +32,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var videoView: VideoView
     private lateinit var tvSpeed: TextView
     private lateinit var tvGuide: TextView
-
     private lateinit var btnLoadVideo: Button
-    private lateinit var btnPrevFrame: Button
-    private lateinit var btnNextFrame: Button
-    private lateinit var btnSetImpact: Button
-    private lateinit var btnSetBounce: Button
-    private lateinit var btnCalculate: Button
 
-    // 영상 분석용 타임스탬프 (ms)
-    private var impactMs: Int = -1
-    private var bounceMs: Int = -1
-    private var videoDurationMs: Int = 0
+    // 오디오 감지 관련
+    private var isAudioRunning = false
+    private val audioScope = CoroutineScope(Dispatchers.IO)
+    private var lastImpactTimestampNs: Long = 0L
+    private var isTracking = false
 
-    // 갤러리 영상 선택 런처
+    // 프레임 모션 감지용
+    private var prevFrameLuma: ByteArray? = null
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
+
     private val pickVideoLauncher = registerForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -55,126 +58,171 @@ class MainActivity : AppCompatActivity() {
         videoView = findViewById(R.id.videoView)
         tvSpeed = findViewById(R.id.tvSpeed)
         tvGuide = findViewById(R.id.tvGuide)
-
         btnLoadVideo = findViewById(R.id.btnLoadVideo)
-        btnPrevFrame = findViewById(R.id.btnPrevFrame)
-        btnNextFrame = findViewById(R.id.btnNextFrame)
-        btnSetImpact = findViewById(R.id.btnSetImpact)
-        btnSetBounce = findViewById(R.id.btnSetBounce)
-        btnCalculate = findViewById(R.id.btnCalculate)
 
-        setupButtons()
+        btnLoadVideo.setOnClickListener {
+            pickVideoLauncher.launch("video/*")
+        }
 
         if (allPermissionsGranted()) {
-            startCamera()
+            startCameraWithAnalyzer()
+            startAudioTrigger()
         } else {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, 10)
         }
     }
 
-    private fun setupButtons() {
-        btnLoadVideo.setOnClickListener {
-            // 스마트폰 갤러리에서 동영상 파일 선택 창 띄우기
-            pickVideoLauncher.launch("video/*")
-        }
+    // 1. 오디오 트리거: 타구음 피크 감지 (자동 임팩트 t0)
+    @SuppressLint("MissingPermission")
+    private fun startAudioTrigger() {
+        val sampleRate = 44100
+        val bufferSize = AudioRecord.getMinBufferSize(
+            sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        val audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC, sampleRate,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
+        )
 
-        // 1프레임(약 16ms ~ 33ms) 단위 앞/뒤 이동
-        btnPrevFrame.setOnClickListener {
-            val current = videoView.currentPosition
-            videoView.seekTo((current - 33).coerceAtLeast(0))
-            updateGuideInfo()
-        }
+        val audioBuffer = ShortArray(bufferSize)
+        audioRecord.startRecording()
+        isAudioRunning = true
 
-        btnNextFrame.setOnClickListener {
-            val current = videoView.currentPosition
-            videoView.seekTo((current + 33).coerceAtMost(videoDurationMs))
-            updateGuideInfo()
-        }
+        audioScope.launch {
+            while (isAudioRunning) {
+                val read = audioRecord.read(audioBuffer, 0, bufferSize)
+                if (read > 0) {
+                    var sum = 0.0
+                    for (i in 0 until read) sum += audioBuffer[i] * audioBuffer[i]
+                    val rms = kotlin.math.sqrt(sum / read)
+                    val db = 20 * log10(rms)
 
-        btnSetImpact.setOnClickListener {
-            impactMs = videoView.currentPosition
-            Toast.makeText(this, "임팩트 시점: ${impactMs}ms", Toast.LENGTH_SHORT).show()
-            updateGuideInfo()
-        }
+                    // 타구음 임계치 (약 82dB 이상) 감지
+                    if (db > 82.0 && !isTracking) {
+                        lastImpactTimestampNs = System.nanoTime()
+                        isTracking = true
 
-        btnSetBounce.setOnClickListener {
-            bounceMs = videoView.currentPosition
-            Toast.makeText(this, "바운드 시점: ${bounceMs}ms", Toast.LENGTH_SHORT).show()
-            updateGuideInfo()
-        }
+                        withContext(Dispatchers.Main) {
+                            tvSpeed.text = "TRACKING"
+                            tvSpeed.setTextColor(Color.parseColor("#FFCC00"))
+                            tvGuide.text = "타구음 감지됨! 바운드 모션 추적 중..."
+                        }
 
-        btnCalculate.setOnClickListener {
-            calculateSpeedFromVideo()
+                        // 1.5초 후에도 바운드가 안 잡히면 자동 리셋
+                        launch {
+                            delay(1500)
+                            if (isTracking) {
+                                isTracking = false
+                                withContext(Dispatchers.Main) {
+                                    tvSpeed.text = "READY"
+                                    tvSpeed.setTextColor(Color.parseColor("#00FF66"))
+                                    tvGuide.text = "대기 중 (서브를 넣으면 자동 측정됩니다)"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            audioRecord.stop()
+            audioRecord.release()
         }
     }
 
-    private fun loadSelectedVideo(uri: Uri) {
-        // 카메라 프리뷰 숨기고 비디오 재생 뷰 활성화
-        viewFinder.visibility = View.GONE
-        videoView.visibility = View.VISIBLE
-
-        // 비디오 제어 버튼들 표시
-        btnPrevFrame.visibility = View.VISIBLE
-        btnNextFrame.visibility = View.VISIBLE
-        btnSetImpact.visibility = View.VISIBLE
-        btnSetBounce.visibility = View.VISIBLE
-        btnCalculate.visibility = View.VISIBLE
-        btnLoadVideo.text = "다른 영상 선택"
-
-        videoView.setVideoURI(uri)
-        videoView.setOnPreparedListener { mp ->
-            videoDurationMs = videoView.duration
-            videoView.seekTo(1) // 첫 프레임 정지 표시
-            tvGuide.text = "영상이 로드되었습니다. [◀1F / 1F▶]로 이동해 임팩트와 바운드를 지정하세요."
-        }
-    }
-
-    private fun updateGuideInfo() {
-        val cur = videoView.currentPosition
-        tvGuide.text = "현재: ${cur}ms | 임팩트: ${if (impactMs >= 0) "${impactMs}ms" else "미지정"} | 바운드: ${if (bounceMs >= 0) "${bounceMs}ms" else "미지정"}"
-    }
-
-    private fun calculateSpeedFromVideo() {
-        if (impactMs < 0 || bounceMs < 0) {
-            Toast.makeText(this, "임팩트와 바운드 시점을 모두 지정해야 합니다.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val dtSec = (bounceMs - impactMs) / 1000.0
-        if (dtSec <= 0.1 || dtSec > 1.5) {
-            Toast.makeText(this, "비행 시간(${dtSec}s)이 비정상적입니다. 다시 지정하세요.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        // 검증된 물리 공식 적용: 거리 17.21m + 항력 보정계수 1.16
-        val distance = 17.21
-        val vAvgMps = distance / dtSec
-        val vAvgKph = vAvgMps * 3.6
-        val vInitKph = vAvgKph * 1.16 // 초속 환산
-
-        tvSpeed.text = "%.1f KM/H".format(vInitKph)
-        tvSpeed.setTextColor(Color.parseColor("#FF2222"))
-        tvGuide.text = "계산 완료! 비행시간: %.3f초 | 환산초속: %.1f km/h".format(dtSec, vInitKph)
-    }
-
-    private fun startCamera() {
+    // 2. 비전 분석: 임팩트 후 서비스 박스 영역 모션 급증 감지 (자동 바운드 t1)
+    private fun startCameraWithAnalyzer() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
             val preview = Preview.Builder().build().also {
                 it.setSurfaceProvider(viewFinder.surfaceProvider)
             }
+
+            val imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
+                processFrameMotion(imageProxy)
+            }
+
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview)
-            } catch (exc: Exception) {
+                cameraProvider.bindToLifecycle(
+                    this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis
+                )
+            } catch (e: Exception) {
                 // Ignore
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private fun processFrameMotion(imageProxy: ImageProxy) {
+        if (!isTracking) {
+            imageProxy.close()
+            return
+        }
+
+        val nowNs = System.nanoTime()
+        val dtFromImpactSec = (nowNs - lastImpactTimestampNs) / 1_000_000_000.0
+
+        // 서브 체공 시간(0.35초 ~ 0.75초) 사이에 들어왔을 때 모션 검사
+        if (dtFromImpactSec in 0.35..0.75) {
+            val plane = imageProxy.planes[0]
+            val buffer = plane.buffer
+            val data = ByteArray(buffer.remaining())
+            buffer.get(data)
+
+            if (prevFrameLuma != null && prevFrameLuma!!.size == data.size) {
+                var diffCount = 0
+                // 연산량 최적화를 위해 16픽셀 간격으로 샘플링 비교
+                for (i in 0 until data.size step 16) {
+                    val diff = kotlin.math.abs(data[i].toInt() - prevFrameLuma!![i].toInt())
+                    if (diff > 35) diffCount++
+                }
+
+                // 공 착지로 인한 급격한 픽셀 변화 감지 (바운드 확정)
+                if (diffCount > 150) {
+                    isTracking = false
+                    calculateAndDisplaySpeed(dtFromImpactSec)
+                }
+            }
+            prevFrameLuma = data
+        }
+
+        imageProxy.close()
+    }
+
+    private fun calculateAndDisplaySpeed(dtSec: Double) {
+        // 검증된 공식: 17.21m + 공기역학 항력 보정계수 1.16
+        val distance = 17.21
+        val vAvgMps = distance / dtSec
+        val vAvgKph = vAvgMps * 3.6
+        val vInitKph = vAvgKph * 1.16
+
+        runOnUiThread {
+            tvSpeed.text = "%.1f KM/H".format(vInitKph)
+            tvSpeed.setTextColor(Color.parseColor("#FF2222"))
+            tvGuide.text = "자동 측정 완료! 비행시간: %.3f초".format(dtSec)
+        }
+    }
+
+    private fun loadSelectedVideo(uri: Uri) {
+        isAudioRunning = false
+        viewFinder.visibility = View.GONE
+        videoView.visibility = View.VISIBLE
+        videoView.setVideoURI(uri)
+        videoView.start()
+        tvGuide.text = "불러온 영상을 재생 중입니다."
+    }
+
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        isAudioRunning = false
+        analysisExecutor.shutdown()
     }
 
     companion object {
