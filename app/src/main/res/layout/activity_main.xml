@@ -17,13 +17,13 @@
         android:layout_height="match_parent"
         android:visibility="gone" />
 
-    <!-- 터치 좌표 및 캘리브레이션 시각화 오버레이 -->
+    <!-- 터치 좌표 감지용 투명 오버레이 -->
     <View
         android:id="@+id/touchOverlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 상단 상태 안내바 -->
+    <!-- 상단 안내 가이드 바 -->
     <TextView
         android:id="@+id/tvGuide"
         android:layout_width="0dp"
@@ -37,7 +37,7 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toStartOf="@id/layoutScoreboard" />
 
-    <!-- 대형 전광판 HUD (초속 + 평균속도 + 실측거리) -->
+    <!-- 대형 HUD 전광판 -->
     <LinearLayout
         android:id="@+id/layoutScoreboard"
         android:layout_width="wrap_content"
@@ -50,7 +50,7 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <TextView
-            android:id="@+id/tvInitSpeed"
+            android:id="@+id/tvSpeed"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="--- KM/H"
@@ -67,7 +67,7 @@
             android:textSize="14sp" />
     </LinearLayout>
 
-    <!-- 하단 컨트롤 바 -->
+    <!-- 하단 컨트롤 패널 -->
     <LinearLayout
         android:id="@+id/layoutControls"
         android:layout_width="match_parent"
