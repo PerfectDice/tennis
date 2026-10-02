@@ -6,13 +6,34 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <!-- 카메라 프리뷰 -->
+    <!-- 카메라 프리뷰 뷰 -->
     <androidx.camera.view.PreviewView
         android:id="@+id/viewFinder"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
-    <!-- 실시간 구속 표시 대형 텍스트 -->
+    <!-- 동영상 재생 뷰 (파일 분석용) -->
+    <VideoView
+        android:id="@+id/videoView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- 상단 안내 가이드 문구 -->
+    <TextView
+        android:id="@+id/tvGuide"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="라이브 모드 | 갤러리 영상 분석을 원하시면 [영상 불러오기]를 누르세요"
+        android:textColor="#FFFFFF"
+        android:textSize="18sp"
+        android:background="#B3000000"
+        android:padding="10dp"
+        android:layout_margin="16dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <!-- 구속 표시 HUD (대형 전광판) -->
     <TextView
         android:id="@+id/tvSpeed"
         android:layout_width="wrap_content"
@@ -25,8 +46,67 @@
         android:shadowDx="4"
         android:shadowDy="4"
         android:shadowRadius="8"
-        android:layout_margin="32dp"
+        android:layout_margin="20dp"
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- 하단 컨트롤 패널 -->
+    <LinearLayout
+        android:id="@+id/layoutControls"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="#CC111111"
+        android:padding="8dp"
+        android:gravity="center"
+        app:layout_constraintBottom_toBottomOf="parent">
+
+        <Button
+            android:id="@+id/btnLoadVideo"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="영상 불러오기"
+            android:layout_marginEnd="6dp" />
+
+        <Button
+            android:id="@+id/btnPrevFrame"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="◀ 1F"
+            android:visibility="gone"
+            android:layout_marginEnd="4dp" />
+
+        <Button
+            android:id="@+id/btnNextFrame"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="1F ▶"
+            android:visibility="gone"
+            android:layout_marginEnd="6dp" />
+
+        <Button
+            android:id="@+id/btnSetImpact"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="임팩트(I)"
+            android:visibility="gone"
+            android:layout_marginEnd="4dp" />
+
+        <Button
+            android:id="@+id/btnSetBounce"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="바운드(B)"
+            android:visibility="gone"
+            android:layout_marginEnd="6dp" />
+
+        <Button
+            android:id="@+id/btnCalculate"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="계산 실행"
+            android:visibility="gone"
+            android:backgroundTint="#FF4444" />
+    </LinearLayout>
 
 </androidx.constraintlayout.widget.ConstraintLayout>
